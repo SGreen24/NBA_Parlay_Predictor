@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
-
 """
-NBA Hypothetical Line Predictor
-================================
+NBA Daily Line Predictor (v3)
+==============================
 
-This script allows you to:
-  1. Pick a team & player.
-  2. Pick an opponent & defender at the same position.
-  3. Gather:
-        • Roster & per-game stats from ESPN (via team_fetcher.py).
-        • Advanced metrics (Off_Rating, Def_Rating, USG%, Pace) via NBAStatsFetcher.
-        • Recent games & head-to-head history via recent_games.py & NBAStatsFetcher.
-        • Injuries and compute injured players’ usage impact.
-  4. Input a line (e.g. 23.5) and Over/Under.
-  5. Compute a probability using:
-        – Baseline per-game average.
-        – Recent‐games normal distribution.
-        – Head‐to‐head adjustments.
-        – Offensive Rating & Pace factors.
-        – Injured‐usage factor.
-        – Defender defensive rating adjustment.
-  6. Print a detailed breakdown of all factors.
+Adds:
+  - Playoff metrics comparison (advanced + hustle) for player vs defender
+  - Comparison table with diffs and rationale on OffRtg vs DefRtg
+  - Fetches “Playoffs” stats if available
 """
 
+import requests
 import math
 import numpy as np
 import pandas as pd
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from advanced_metrics import NBAStatsFetcher
 from recent_games import get_espn_player_id
@@ -37,301 +26,247 @@ from team_fetcher import (
 )
 
 # -----------------------------------------------------------------------
-#  CONSTANTS
+# CONFIG & CONSTANTS
 # -----------------------------------------------------------------------
+WEIGHTS = {"baseline":0.35,"recent":0.30,"h2h":0.20,"injury":0.15}
+REST_FACTOR = {"b2b":0.90,"short":0.98,"normal":1.02}
+MIN_EMPIRICAL = 10
+H2H_GAMES     = 5
+RECENT_GAMES  = 5
+INJ_WEIGHT    = 0.01
+LETTER_MAP    = {"P":"PTS","R":"REB","A":"AST"}
 
-LEAGUE_AVG_DEF_RATING = 110.0    # League-average defensive rating
-LEAGUE_AVG_OFF_RATING = 110.0    # League-average offensive rating
-LEAGUE_AVG_PACE       = 100.0    # League-average pace
-H2H_LOOKBACK_GAMES    = 5        # How many head-to-head games to consider
-RECENT_LOOKBACK       = 5        # How many recent games to consider
-INJ_USAGE_WEIGHT      = 0.01     # Weight per 1% USG lost
+# static league averages
+LG_OFF = 110.0
+LG_DEF = 110.0
+LG_PACE= 100.0
 
 # -----------------------------------------------------------------------
-#  UTILITIES
+# UTILITIES
 # -----------------------------------------------------------------------
+def make_session():
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.3, status_forcelist=(500,502,503,504))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    return s
 
-def log(msg: str):
-    """Print a timestamped message."""
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}")
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-def normal_cdf(x: float) -> float:
-    """Compute the standard normal CDF for x."""
+def normal_cdf(x):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
-def calc_prob(mean: float, std: float, line: float, ou: str) -> float:
-    """
-    Given a normal distribution (mean, std):
-      - if Over, returns P(X > line)
-      - if Under, returns P(X < line)
-    """
-    if std <= 0:
-        return 1.0 if (ou == "O" and mean > line) or (ou == "U" and mean < line) else 0.0
-    z = (line - mean) / std
-    return (1 - normal_cdf(z)) if ou == "O" else normal_cdf(z)
+def empirical_prob(vals, line, ou):
+    arr = np.array(vals)
+    if ou=="O":
+        return float((arr>line).sum()/len(arr))
+    return float((arr<line).sum()/len(arr))
 
-# -----------------------------------------------------------------------
-#  SECTION 1: TEAM & PLAYER SELECTION
-# -----------------------------------------------------------------------
+def gauss_prob(mean, std, line, ou):
+    if std<=0:
+        return 1.0 if (ou=="O" and mean>line) or (ou=="U" and mean<line) else 0.0
+    z=(line-mean)/std
+    return (1-normal_cdf(z)) if ou=="O" else normal_cdf(z)
 
-def select_team(prompt: str):
-    """
-    Prompt for a team abbrev, then fetch roster, per-game stats, and injuries.
-    Returns: (abbrev, roster_df, pergame_df, inj_df)
-    """
-    while True:
-        abbrev = input(f"{prompt} (NBA abbrev, e.g. 'GS'): ").strip().upper()
-        try:
-            roster  = fetch_full_roster(abbrev)
-            pergame = fetch_team_per_game_stats(abbrev)
-            injuries = fetch_espn_injuries(abbrev)
-            log(f"Loaded data for {abbrev}")
-            return abbrev, roster, pergame, injuries
-        except Exception as e:
-            log(f"Error loading '{abbrev}': {e}")
-            print("Please try again.\n")
-
-def display_roster_names(roster_df: pd.DataFrame, inj_df: pd.DataFrame):
-    """
-    Print each PLAYER name, appending ' (Inactive)' if listed in inj_df.
-    """
-    print("\nRoster:")
-    injured = set(inj_df["PLAYER"])
-    for name in roster_df["PLAYER"]:
-        suffix = " (Inactive)" if name in injured else ""
-        print(f"  - {name}{suffix}")
-    print("")
-
-def choose_player(roster_df: pd.DataFrame) -> str:
-    """Prompt until the user chooses a valid player name from roster_df."""
-    names = roster_df["PLAYER"].tolist()
-    while True:
-        name = input("Choose your player (full name): ").strip()
-        if name in names:
-            log(f"Player chosen: {name}")
-            return name
-        log(f"Invalid player name: {name}")
-        print("Name not in roster; try again.\n")
-
-# -----------------------------------------------------------------------
-#  SECTION 2: OPPONENT DEFENDER SELECTION
-# -----------------------------------------------------------------------
-
-def find_opponent_starter(op_abbrev: str, position: str) -> str:
-    """
-    Fetch the opponent roster and return the first player whose POSITION matches.
-    """
-    opp_roster = fetch_full_roster(op_abbrev)
-    matches = [row["PLAYER"] for _, row in opp_roster.iterrows()
-               if row["POSITION"] == position]
-    if not matches:
-        raise ValueError(f"No player at position '{position}' on {op_abbrev}")
-    defender = matches[0]
-    log(f"Defender chosen: {defender} ({position})")
-    return defender
-
-# -----------------------------------------------------------------------
-#  SECTION 3: ADVANCED METRIC FETCHING
-# -----------------------------------------------------------------------
-
-def get_player_advanced(fetcher: NBAStatsFetcher, player_name: str):
-    """
-    Fetch:
-      - Base stats (traditional)
-      - Advanced stats (Off/Def Rating, USG%, Pace)
-      - Hustle stats (unused here)
-    Returns: (base_dict, adv_dict, hustle_dict)
-    """
-    pid = fetcher.search_player_nba(player_name)
-    if pid is None:
-        raise ValueError(f"Could not find NBA.com ID for {player_name}")
-    base   = fetcher.get_nba_stats(pid, "Base") or {}
-    adv    = fetcher.get_nba_stats(pid, "Advanced") or {}
-    hustle = fetcher.get_nba_hustle_stats(pid) or {}
-    off_rt = adv.get("OFF_RATING", LEAGUE_AVG_OFF_RATING)
-    def_rt = adv.get("DEF_RATING", LEAGUE_AVG_DEF_RATING)
-    pace   = adv.get("PACE", LEAGUE_AVG_PACE)
-    usage  = adv.get("USG_PCT", 0.0)
-    log(f"{player_name}: OffRT={off_rt}, DefRT={def_rt}, Pace={pace}, USG%={usage}")
-    return base, adv, hustle
-
-# -----------------------------------------------------------------------
-#  SECTION 4: HEAD-TO-HEAD & RECENT FORM
-# -----------------------------------------------------------------------
-
-def compute_head_to_head(fetcher: NBAStatsFetcher, pid: str, opp_abbrev: str):
-    """
-    Compute mean & std for PTS, REB, AST from last H2H_LOOKBACK_GAMES vs opp_abbrev.
-    """
-    games = fetcher.get_recent_games_stats(pid, num_games=50) or []
-    h2h = [g for g in games if f" {opp_abbrev}" in g["MATCHUP"]][:H2H_LOOKBACK_GAMES]
-    if not h2h:
-        log("No head-to-head games found.")
-        return {}, {}
-    df = pd.DataFrame(h2h)
-    means = df[["PTS","REB","AST"]].astype(float).mean().to_dict()
-    stds  = df[["PTS","REB","AST"]].astype(float).std().to_dict()
-    log(f"H2H means: {means}, stds: {stds}")
-    return means, stds
-
-def compute_recent_distribution(fetcher: NBAStatsFetcher, pid: str, line_choice: str):
-    """
-    Compute mean & std for the last RECENT_LOOKBACK games for the chosen stat(s).
-    """
-    games = fetcher.get_recent_games_stats(pid, num_games=RECENT_LOOKBACK) or []
-    vals = []
-    for g in games[:RECENT_LOOKBACK]:
-        s = 0
-        if "P" in line_choice: s += float(g["PTS"])
-        if "R" in line_choice: s += float(g["REB"])
-        if "A" in line_choice: s += float(g["AST"])
-        vals.append(s)
-    if not vals:
-        return 0.0, 0.0
-    mean = float(np.mean(vals))
-    std  = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
-    log(f"Recent {line_choice}: mean={mean}, std={std}")
-    return mean, std
-
-# -----------------------------------------------------------------------
-#  SECTION 5: INJURY USAGE IMPACT
-# -----------------------------------------------------------------------
-
-def compute_injury_usage_impact(fetcher: NBAStatsFetcher, injuries: pd.DataFrame):
-    """
-    Sum USG% of each injured player, then return multiplier:
-      1 + (total_usg% * INJ_USAGE_WEIGHT)
-    """
+def compute_injury_usage_impact(fetcher, injuries):
     total_usg = 0.0
     for name in injuries["PLAYER"]:
         try:
-            _, adv, _ = get_player_advanced(fetcher, name)
+            _, adv = get_player_stats(fetcher, name, "Playoffs")
             usg = adv.get("USG_PCT", 0.0)
             total_usg += usg
-            log(f"Injured {name} USG%={usg}")
-        except Exception:
-            log(f"Could not fetch advanced for injured {name}")
-    mult = 1.0 + (total_usg * INJ_USAGE_WEIGHT)
-    log(f"Injury usage multiplier: {mult:.3f} (total_usg={total_usg:.1f}%)")
+            log(f"Injured {name} USG% = {usg}")
+        except:
+            log(f"Could not fetch injured {name}")
+    mult = 1 + (total_usg * INJ_WEIGHT)
+    log(f"Injury multiplier: {mult:.3f}")
     return mult
 
-# -----------------------------------------------------------------------
-#  SECTION 6: LINE INPUT PROMPTS
-# -----------------------------------------------------------------------
 
-def prompt_stat_choice():
-    valid = {"P","R","A","PR","PA","RA","PRA"}
-    while True:
-        c = input("What stat(s)? (P, R, A or combo e.g. 'PR'): ").strip().upper()
-        if c in valid:
-            return c
-        print("Invalid; try one of:", ", ".join(sorted(valid)))
+# -----------------------------------------------------------------------
+# REST FACTOR (uses most recent game date)
+# -----------------------------------------------------------------------
+def get_rest_factor(fetcher, pid):
+    recent = fetcher.get_recent_games_stats(pid, num_games=1) or []
+    if not recent or "DATE" not in recent[0]:
+        return REST_FACTOR["normal"]
+    last = pd.to_datetime(recent[0]["DATE"], errors="coerce")
+    if pd.isna(last):
+        return REST_FACTOR["normal"]
+    days = (datetime.now()-last.to_pydatetime()).days
+    return REST_FACTOR["b2b"] if days==0 else REST_FACTOR["short"] if days==1 else REST_FACTOR["normal"]
 
-def prompt_line_value():
+# -----------------------------------------------------------------------
+# Fetch advanced & hustle stats for a given season type
+# -----------------------------------------------------------------------
+def get_player_stats(fetcher, name, season_type="Regular Season"):
+    pid = fetcher.search_player_nba(name)
+    if pid is None:
+        raise ValueError(f"No NBA.com ID for {name}")
+    base   = fetcher.get_nba_stats(pid,"Base",season_type)     or {}
+    adv    = fetcher.get_nba_stats(pid,"Advanced",season_type) or {}
+    hustle = fetcher.get_nba_hustle_stats(pid,season_type)     or {}
+    log(f"{name} ({season_type}): OffRT={adv.get('OFF_RATING')}, DefRT={adv.get('DEF_RATING')}, Pace={adv.get('PACE')}, USG%={adv.get('USG_PCT')}")
+    return pid, base, adv, hustle
+
+# -----------------------------------------------------------------------
+# Selection & prompting functions (unchanged)
+# -----------------------------------------------------------------------
+def select_team(prompt):
     while True:
-        raw = input("Enter your predicted line value (e.g. 23.5): ").strip()
+        abb = input(f"{prompt} (NBA abbrev): ").strip().upper()
         try:
-            return float(raw)
-        except:
-            print("Invalid number; try again.")
+            r, pg, inj = fetch_full_roster(abb), fetch_team_per_game_stats(abb), fetch_espn_injuries(abb)
+            log(f"Loaded {abb}")
+            return abb, r, pg, inj
+        except Exception as e:
+            log(f"Error loading {abb}: {e}")
+            print("Try again.\n")
 
-def prompt_over_under():
+def display_roster(r_df, inj_df):
+    inj = set(inj_df["PLAYER"])
+    print("\nRoster:")
+    for n in r_df["PLAYER"]:
+        suffix = " (Inactive)" if n in inj else ""
+        print(f"  - {n}{suffix}")
+    print("")
+
+def choose_player(r_df):
+    names = r_df["PLAYER"].tolist()
     while True:
-        raw = input("Over or Under? (O/U): ").strip().upper()
-        if raw in {"O","U"}:
-            return raw
-        print("Invalid; enter O or U.")
+        n = input("Choose your player (full name): ").strip()
+        if n in names:
+            log(f"Player chosen: {n}")
+            return n
+        print("Name not found; try again.")
+
+def find_defender(opp, pos):
+    df = fetch_full_roster(opp)
+    matches=[r["PLAYER"] for _,r in df.iterrows() if r["POSITION"]==pos]
+    if not matches: raise ValueError(f"No {pos} on {opp}")
+    log(f"Defender chosen: {matches[0]} ({pos})")
+    return matches[0]
+
+def prompt_stat():
+    valid={"P","R","A","PR","PA","RA","PRA"}
+    while True:
+        c=input("What stat(s)? (P, R, A or combo e.g. 'PRA'): ").strip().upper()
+
+        if c in valid: return c
+        print("Invalid; try again.")
+
+def prompt_line():
+    while True:
+        try: return float(input("Enter line (e.g. 23.5): ").strip())
+        except: print("Not a number.")
+
+def prompt_ou():
+    while True:
+        o=input("Over or Under? (O/U): ").strip().upper()
+        if o in {"O","U"}: return o
+        print("Enter O or U.")
 
 # -----------------------------------------------------------------------
-#  SECTION 7: MAIN WORKFLOW
+# MAIN
 # -----------------------------------------------------------------------
-
 def main():
-    print("\n" + "="*60)
-    print("      NBA Hypothetical Line Predictor")
-    print("="*60 + "\n")
-
-    # 1) Select your team & player
-    your_abbrev, roster_df, stats_df, inj_df = select_team(
-        "What team would you like to find a player to bet on?"
-    )
-    display_roster_names(roster_df, inj_df)
-    player_name = choose_player(roster_df)
-    position    = roster_df.loc[roster_df["PLAYER"]==player_name, "POSITION"].iloc[0]
-
-    # 2) Select opponent & defender
-    opp_abbrev, _, _, _ = select_team("Name your hypothetical OPPONENT team")
-    defender = find_opponent_starter(opp_abbrev, position)
-
-    # 3) Fetch all metrics
+    sess    = make_session()
     fetcher = NBAStatsFetcher()
-    pid = fetcher.search_player_nba(player_name)
-    base, adv, hustle = get_player_advanced(fetcher, player_name)
-    _, opp_adv, _     = get_player_advanced(fetcher, defender)
+    fetcher.session = sess  # if you update fetcher internals
 
-    # 4) Baseline per-game total for stat_choice
-    stat_choice = prompt_stat_choice()
-    baseline = sum(
-        base.get("PTS",0) if c=="P" else
-        base.get("REB",0) if c=="R" else
-        base.get("AST",0) if c=="A" else 0
-        for c in stat_choice
+    print("\n" + "="*50)
+    print("    NBA Daily Line Predictor (v3)")
+    print("="*50 + "\n")
+
+    # 1) Pick teams & players
+    your, roster_df, _, inj_df = select_team("Your team?")
+    display_roster(roster_df, inj_df)
+    player = choose_player(roster_df)
+    pos    = roster_df.loc[roster_df["PLAYER"]==player,"POSITION"].iloc[0]
+
+    opp, _, _, _ = select_team("Opponent team?")
+    defender = find_defender(opp, pos)
+
+    # 2) Fetch metrics
+    pid, base_reg, adv_reg, hustle_reg             = get_player_stats(fetcher, player,   "Regular Season")
+    _,   _,       opp_adv_reg, opp_hustle_reg      = get_player_stats(fetcher, defender, "Regular Season")
+    _,   base_pl, adv_pl,    hustle_pl             = get_player_stats(fetcher, player,   "Playoffs")
+    _,   _,       opp_adv_pl, opp_hustle_pl        = get_player_stats(fetcher, defender, "Playoffs")
+
+    # 3) Display playoff comparison
+    print("\nPlayoff Advanced Metrics (player vs defender):")
+    for m in ["OFF_RATING","DEF_RATING","PACE","USG_PCT","TS_PCT","EFG_PCT","AST_PCT","OREB_PCT","DREB_PCT","PIE"]:
+        pv, dv = adv_pl.get(m,0), opp_adv_pl.get(m,0)
+        diff = pv - dv
+        print(f"  {m:12}: {pv:>5.1f} vs {dv:>5.1f}   diff {diff:+.1f}")
+
+    print("\nPlayoff Hustle Metrics:")
+    for h in ["CONTESTED_SHOTS","DEFLECTIONS","CHARGES_DRAWN","SCREEN_ASSISTS","LOOSE_BALLS_RECOVERED","DEF_BOXOUTS","OFF_BOXOUTS"]:
+        ph, dh = hustle_pl.get(h,0), opp_hustle_pl.get(h,0)
+        print(f"  {h:25}: {ph:>4} vs {dh:>4}   diff {ph-dh:+4}")
+
+    # 4) Stat choice & distributions
+    stat_choice = prompt_stat()
+    baseline    = sum(base_reg.get(LETTER_MAP[c],0) for c in stat_choice)
+
+    hist = fetcher.get_recent_games_stats(pid, num_games=RECENT_GAMES*4) or []
+    hist_vals = [sum(float(g[LETTER_MAP[c]]) for c in stat_choice) for g in hist]
+
+    recent_mean, recent_std = (np.mean(hist_vals), np.std(hist_vals,ddof=1)) if hist_vals else (0,0)
+
+    h2h_games = [g for g in hist if opp in g.get("MATCHUP","")]  [:H2H_GAMES]
+    h2h_vals  = [sum(float(g[LETTER_MAP[c]]) for c in stat_choice) for g in h2h_games]
+    h2h_mean  = np.mean(h2h_vals) if h2h_vals else baseline
+
+    # 5) Injury & context factors
+    inj_mult  = compute_injury_usage_impact(fetcher, inj_df)
+    rest_mult = get_rest_factor(fetcher, pid)
+    home_mult = 1.0  # stub
+
+    # 6) Blend
+    blend_mean = (
+        WEIGHTS["baseline"] * baseline +
+        WEIGHTS["recent"]   * recent_mean +
+        WEIGHTS["h2h"]      * h2h_mean +
+        WEIGHTS["injury"]   * (baseline*inj_mult)
     )
-    log(f"Baseline per-game {stat_choice} = {baseline:.1f}")
-
-    # 5) Head-to-head & recent
-    h2h_means, h2h_stds       = compute_head_to_head(fetcher, pid, opp_abbrev)
-    recent_mean, recent_std   = compute_recent_distribution(fetcher, pid, stat_choice)
-
-    # 6) Injury usage
-    inj_usage_mult = compute_injury_usage_impact(fetcher, inj_df)
+    blend_std  = recent_std
 
     # 7) Prompt line
-    line_val = prompt_line_value()
-    ou       = prompt_over_under()
+    line_val = prompt_line()
+    ou       = prompt_ou()
 
-    # 8) Blend mean & std
-    h2h_mean = h2h_means.get(stat_choice, baseline) if len(stat_choice)==1 else baseline
-    blend_mean = (
-        0.4 * baseline +
-        0.3 * recent_mean +
-        0.2 * h2h_mean +
-        0.1 * (baseline * inj_usage_mult)
-    )
-    blend_std = recent_std
+    # 8) Raw probability
+    if len(hist_vals)>=MIN_EMPIRICAL:
+        p_raw = empirical_prob(hist_vals,line_val,ou)
+    else:
+        p_raw = gauss_prob(blend_mean,blend_std,line_val,ou)
 
-    # 9) Base probability
-    prob = calc_prob(blend_mean, blend_std, line_val, ou)
+    # 9) Strength adjustments
+    off_f  = adv_reg.get("OFF_RATING",LG_OFF)/LG_OFF
+    pace_f = adv_reg.get("PACE",LG_PACE)/LG_PACE
+    def_f  = LG_DEF/opp_adv_reg.get("DEF_RATING",LG_DEF)
 
-    # 10) Offense & pace adjustment
-    off_factor  = adv.get("OFF_RATING", LEAGUE_AVG_OFF_RATING) / LEAGUE_AVG_OFF_RATING
-    pace_factor = adv.get("PACE", LEAGUE_AVG_PACE) / LEAGUE_AVG_PACE
-    prob *= off_factor * pace_factor
+    # 10) Final probability
+    p_final = p_raw*off_f*pace_f*def_f*inj_mult*rest_mult*home_mult
+    p_final = max(0,min(1,p_final))
 
-    # 11) Defender defensive rating adjustment
-    def_factor = LEAGUE_AVG_DEF_RATING / opp_adv.get("DEF_RATING", LEAGUE_AVG_DEF_RATING)
-    prob *= def_factor
-
-    # 12) Clamp and output
-    prob = max(0.0, min(1.0, prob))
-
+    # 11) Print result & rationale
     print("\n" + "-"*50)
-    print(f"Matchup: {player_name} vs {defender}")
-    print(f"Line: {stat_choice} {ou} {line_val}")
-    print("-"*50)
-    print(f"Estimated probability: {prob*100:.2f}%\n")
-    print("Breakdown of factors:")
+    print(f"{player} vs {defender} | {stat_choice} {ou} {line_val}")
+    print(f"Est. probability: {p_final*100:.1f}%\n")
+    print("Rationale for Off/Def factor:")
+    diff = adv_reg.get("OFF_RATING",0) - opp_adv_reg.get("DEF_RATING",0)
+    print(f" • {player}'s OffRtg ({adv_reg.get('OFF_RATING'):.1f}) vs {defender}'s DefRtg ({opp_adv_reg.get('DEF_RATING'):.1f}) => diff {diff:+.1f}, off factor={off_f:.2f}×")
+    print("\nBreakdown:")
     print(f" • Baseline per-game:       {baseline:.1f}")
-    print(f" • Recent mean/std:         {recent_mean:.1f} / {recent_std:.1f}")
-    if h2h_means:
-        print(f" • H2H mean:                {h2h_mean:.1f}")
-    print(f" • Injury usage multiplier: {inj_usage_mult:.2f}×")
-    print(f" • Blended mean:            {blend_mean:.1f}")
-    print(f" • Std used:                {blend_std:.1f}")
-    print(f" • Off. Rating factor:      {off_factor:.2f}×")
-    print(f" • Pace factor:             {pace_factor:.2f}×")
-    print(f" • Defender factor:         {def_factor:.2f}×")
+    print(f" • Recent mean/std:         {recent_mean:.1f}/{recent_std:.1f}")
+    print(f" • H2H mean:                {h2h_mean:.1f}")
+    print(f" • Injury multiplier:       {inj_mult:.2f}×")
+    print(f" • Rest factor:             {rest_mult:.2f}×")
+    print(f" • Off factor:              {off_f:.2f}×")
+    print(f" • Pace factor:             {pace_f:.2f}×")
+    print(f" • Def factor:              {def_f:.2f}×")
     print("="*50 + "\n")
 
 if __name__ == "__main__":
