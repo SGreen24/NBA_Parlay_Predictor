@@ -6,6 +6,7 @@ Making an app that gives you optimized predictions for nba parlays based on give
 1. requests
 2. pandas
 3. nba_api
+4. tabulate
 
 
 # Work so far
