@@ -136,8 +136,8 @@ def fetch_team_per_game_stats(abbrev: str, season: str = "2024-25") -> pd.DataFr
 
 
 def main():
-    espn_abbrev = "GS"
-    nba_abbrev  = "GSW"
+    espn_abbrev = "PHI"
+    nba_abbrev  = "PHI"
 
     # 1) Roster + position
     roster_df = fetch_full_roster(espn_abbrev)
